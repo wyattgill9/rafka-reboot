@@ -1,0 +1,12 @@
+[package]
+name = "rafka"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cbridge = { version = "0.1.0", path = "crates/cbridge" }
+
+[workspace]
+members = [
+    "crates/cbridge"
+]
