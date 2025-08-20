@@ -20,6 +20,7 @@ type BrokerId    = u32;
 type PartitionId = u32;
 type TopicName   = String;
 
+// Simple in-memory log system, TODO: move to disk storage like kafka
 struct InMemLog {
     messages: VecDeque<Message>,
     seq_start: u64,

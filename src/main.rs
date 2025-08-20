@@ -17,5 +17,4 @@ use broker::Broker;
 fn main() {
     let mut broker: Broker = Broker::new(0);
     broker.create_partition(String::from("Orders"), 0, true);
-    println!("{:?}", add(1, 1));
 }

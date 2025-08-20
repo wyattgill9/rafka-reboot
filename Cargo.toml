@@ -9,6 +9,8 @@ common  = { version = "0.1.0", path = "crates/common"  }
 cbridge = { version = "0.1.0", path = "crates/cbridge" }
 util    = { version = "0.1.0", path = "crates/util"    }
 
+bytemuck = "1.23.2"
+
 [workspace]
 members = [
     "crates/broker" ,

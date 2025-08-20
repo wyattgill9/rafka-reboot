@@ -1,11 +1,15 @@
 fn main() {
-    cc::Build::new()
-        .file("include/test/lib.c")
-        .include("include/test")
-        .compile("test");
+    let mut build = cc::Build::new();
 
-    // cc::Build::new()
-        // .file("include/test2/lib.c")
-    //     .include("include/test2")
-    //     .compile("test2");
+    build.include("./include");
+
+    // compile every .c file in ./csrc
+    for entry in std::fs::read_dir("csrc").unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|s| s.to_str()) == Some("c") {
+            build.file(path);
+        }
+    }
+
+    build.compile("bridge");
 }
