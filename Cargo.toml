@@ -1,12 +1,18 @@
 [package]
-name = "rafka"
+name = "rafka-reboot"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+broker  = { version = "0.1.0", path = "crates/broker"  }
+common  = { version = "0.1.0", path = "crates/common"  } 
 cbridge = { version = "0.1.0", path = "crates/cbridge" }
+util    = { version = "0.1.0", path = "crates/util"    }
 
 [workspace]
 members = [
-    "crates/cbridge"
+    "crates/broker" ,
+    "crates/common",
+    "crates/cbridge", 
+    "crates/util"   ,
 ]
