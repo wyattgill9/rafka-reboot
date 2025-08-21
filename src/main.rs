@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 /// TODO LIST:
 // SINGLE-BROKER (SINGLE NODE):
 // - RUST: Raft Algorithm, crates/raft
