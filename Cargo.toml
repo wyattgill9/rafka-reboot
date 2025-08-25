@@ -5,17 +5,20 @@ edition = "2024"
 
 [dependencies]
 broker  = { version = "0.1.0", path = "crates/broker"  }
-common  = { version = "0.1.0", path = "crates/common"  } 
+client  = { version = "0.1.0", path = "crates/client"  } 
 cbridge = { version = "0.1.0", path = "crates/cbridge" }
 util    = { version = "0.1.0", path = "crates/util"    }
 
 [workspace]
 members = [
     "crates/broker" ,
-    "crates/common",
+    "crates/client",
     "crates/cbridge", 
-    "crates/util"   ,
+    "crates/util"   , "crates/cli",
 ]
 
 [workspace.dependencies]
-zerocopy = { version = "0.8.26", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+clap =  { version = "4", features = ["derive"] }
+rkyv =  { version = "0.8.11" }
+dashmap = "6.1.0"

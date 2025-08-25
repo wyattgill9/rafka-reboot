@@ -13,10 +13,34 @@
 // MULI-BROKER (DISTRIBUTED):
 // TODO
 
+/// API
+
+// $ cargo install rafka
+
+// $ rafka server start
+
+// use rafka::client::Client;
+
+// #[tokio::main]
+// async fn main() -> Result<()> {
+//     let client = Client::connect("localhost:8080").await?;
+    
+//     // Publish a message
+//     client.publish("my-topic", "Hello, Rafka!").await?;
+    
+//     // Subscribe to messages
+//     let mut subscriber = client.subscribe("my-topic").await?;
+//     while let Some(msg) = subscriber.next().await {
+//         println!("Received: {}", msg);
+//     }
+// }
+
+/// MAIN
+
 use cbridge::add;
 use broker::Broker;
 
 fn main() {
-    let mut broker: Broker = Broker::new(0);
-    broker.create_partition(String::from("Orders"), 0, true);
+    let mut broker: Broker = Broker::new(0, String::from("2020"));
+    println!("{}", broker.is_controller());
 }
