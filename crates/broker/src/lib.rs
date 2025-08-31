@@ -1,201 +1,141 @@
-#![allow(dead_code, unused_imports)]
+#![allow(unused_imports, dead_code)]
 
 use std::{
-    collections::{HashMap, VecDeque},
-    path::PathBuf,
-    sync::atomic::{AtomicUsize, Ordering},
-    sync::Arc,
+    collections::VecDeque,
+    sync::{Arc, RwLock, atomic::{AtomicUsize, Ordering}}
 };
-
+use tokio::sync::mpsc; 
 use dashmap::DashMap;
 
-use tokio::{
-    fs::symlink_metadata, io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}, sync::mpsc
-};
+use util::global_time;
 
-use util::{global_time, ClientRequest, ClientResponse, Message, BrokerError};
+pub type RafkaResult<T> = std::result::Result<T, RafkaError>;
 
-type BrokerId    = u32;
-type PartitionId = u32;
-type TopicName   = String;
-
-// A Partition 
-pub struct PartitionReplica { 
-    // topic: TopicName,
-
-    partition_id: PartitionId,
-
-    // InMemoryLog
-    messages: Vec<Message>,
-    seq_start: usize,
-
-    // if leader
-    is_leader: bool,
-    followers: Option<Vec<BrokerId>>, 
+#[derive(Debug)]
+pub enum RafkaError {
+    
 }
 
-impl PartitionReplica {
-    pub fn new(partition_id: PartitionId, seq_start: usize, is_leader: bool) -> Self {
+
+#[derive(Debug, Clone)]
+pub struct Message {
+    pub id:        u64,
+    pub topic:     String, // addr
+    pub payload:   Vec<u8>,
+    pub timestamp: u64,
+    pub partition: PartitionId,
+}
+
+pub type PartitionId = usize;
+
+#[derive(Debug, Clone)]
+pub struct Partition {
+    pub id:        PartitionId,
+    pub messages:  VecDeque<Message>,
+    pub offset:    u64,
+}
+
+impl Partition {
+    pub fn new(id: PartitionId) -> Self {
         Self {
-            partition_id,
-            messages: Vec::new(),
-            seq_start,
-            is_leader,
-            followers: if is_leader { Some(Vec::new()) } else { None },
+            id,
+            messages: VecDeque::new(),
+            offset:   0
         }
     }
 
-    pub fn append_message(&mut self, message: Message) -> Result<(), BrokerError> {
-        if !self.is_leader {
-            return Err(BrokerError::NotLeader);
-        }
-
-        self.messages.push(message);
-        Ok(())
+    pub fn append(&mut self, message: Message) {
+        self.messages.push_back(message);
+        self.offset += 1;
     }
-    
-    // maybe just return a &[Message] - much more efficient
-    pub fn consume_from(&self, sequence: usize) -> Vec<Message> {
-        if sequence > self.seq_start {
-            return Vec::new();
-        }
 
-        let start_idx = sequence - self.seq_start;
-
-        if start_idx >= self.messages.len() {
-            Vec::new()
-        } else {
-            self.messages[start_idx..].to_vec()
-        }
-    }
-   
-    pub fn latest_sequence(&self) -> usize {
-        self.seq_start + self.messages.len()
-    }
-    
-    pub fn add_follower(&mut self, broker_id: BrokerId) -> Result<(), BrokerError> {
-        if !self.is_leader {
-            return Err(BrokerError::NotLeader);
-        }
-
-        if let Some(followers) = &mut self.followers {
-            if !followers.contains(&broker_id) {
-                followers.push(broker_id);
-            }
-        }
-        Ok(())
-    }
-    
-    pub fn remove_follower(&mut self, broker_id: BrokerId) -> Result<(), BrokerError> {
-        if !self.is_leader {
-            return Err(BrokerError::NotLeader);
-        }
-        
-        if let Some(followers) = &mut self.followers {
-            if let Some(pos) = followers.iter().position(|&x| x == broker_id) {
-                followers.remove(pos);
-            }
-        }
-        Ok(())
+    pub fn read_from(&self, offset: u64) -> impl Iterator<Item = &Message> {
+        self.messages
+            .iter()
+            .skip(offset as usize) // only include after messages after the given "offset"
     }
 }
 
+#[derive(Debug)]
 pub struct Topic {
-    name: String,
+    pub name:       String, // ie "8080"
+    pub partitions: Vec<RwLock<Partition>>,
 
-    partitions: DashMap<PartitionId, PartitionReplica>,
-    
     // Metadata
-    rep_factor: u32,
-    created_at: u64,
-    next_partition: AtomicUsize, // next partition to send message to
+    cur_partition:  AtomicUsize,
+    pub cur_id:     AtomicUsize
 }
 
 impl Topic {
-    pub fn new(name: String, num_partitions: u32, rep_factor: u32) -> Self {
-        let partitions = (0..num_partitions)
-            .map(|i| {
-                let is_leader = i == 0; // if its 0, leader is true
-                let replica = PartitionReplica::new(i, 0, is_leader);
-                (i, replica)
-            })
-            .collect();
+    pub fn new(name: String, partition_count: usize) -> Self {
+        let mut partitions: Vec<RwLock<Partition>> = Vec::with_capacity(partition_count as usize);
+        for p in 0..=partition_count {
+            partitions.push(RwLock::new(Partition::new(p)));
+        }
 
         Self {
             name,
             partitions,
-            rep_factor,
-            created_at: global_time(),
-            next_partition: AtomicUsize::new(0)
+            cur_partition: AtomicUsize::new(0),
+            cur_id:        AtomicUsize::new(0)
         }
     }
 
-    pub fn get_partition_for_message(&self) -> PartitionId {
-        let num_partitions = self.partitions.len();
-        if num_partitions == 0 { return 0 }
+    pub async fn publish(&self, payload: Vec<u8>) -> RafkaResult<()> {
+        let part_idx = self.get_partition();
 
-        let next = self.next_partition.fetch_add(1, Ordering::SeqCst);
-        (next % num_partitions) as u32 // technically i should move around the types cause usize % u32, but im lazy
+        let msg = Message {
+            id: Self::get_new_message_id(&self),
+            topic: self.name.clone() ,
+            payload,
+            timestamp: global_time(),
+            partition: part_idx,
+        };
+
+        // Write to partition
+        {
+            let mut part = self.partitions[part_idx].write().unwrap();
+            part.append(msg.clone())
+        }
+
+        // maybe notify subscribers idk
+
+        Ok(())
     }
 
-    pub fn publish_message(&self, message: Message) -> Result<(), BrokerError> {
-        let part_id = self.get_partition_for_message();
+    /// Simple Round Robin
+    fn get_partition(&self) -> PartitionId {
+        let i = self.cur_partition.fetch_add(1, Ordering::Relaxed);
+        i % self.partitions.len()
+    }
 
-        if let Some(mut partition) = self.partitions.get_mut(&part_id) {
-            partition.append_message(message)
-        } else {
-            Err(BrokerError::PartitionNotFound)
-        }
+    fn get_new_message_id(&self) -> u64 {
+        let val = self.cur_id.fetch_add(1, Ordering::Relaxed);
+        val.try_into().unwrap()
     }
 }
 
+#[derive(Debug)]
 pub struct Broker {
-    id: BrokerId,
-    addr: String, 
-    topics: DashMap<TopicName, Topic>,
-
-    is_controller: bool,
+    topics: DashMap<String, Topic>
 }
 
 impl Broker {
-    pub fn new(id: BrokerId, address: String) -> Self {
+    pub fn new() -> Self {
         Self {
-            id,
-            addr: address,
-            topics: DashMap::new(),
-            is_controller: id == 0
+            topics: DashMap::new()
         }
     }
 
-    pub async fn start(&self) {}
-
-    async fn handle_client() {}
-
-    async fn process_request(&mut self, request: ClientRequest) -> ClientResponse {
-        match request {
-            ClientRequest::CreateTopic { topic, num_partitions, rep_factor } => {
-                let replication_factor = rep_factor.unwrap_or(1);
-                let new_topic = Topic::new(topic.clone(), num_partitions, replication_factor);
-                self.topics.insert(topic.clone(), new_topic);
-                ClientResponse::TopicCreated { topic }
-            },
-            ClientRequest::Subscribe { topic } => {
-                todo!();
-            },
-            ClientRequest::Unsubscribe { topic } => {
-                todo!();
-            },
-            ClientRequest::Publish { topic, payload, timestamp } => {
-                todo!();               
-            },
-        }
+    pub async fn start(&self, _addr: &str) -> RafkaResult<()> {
+        Ok(())
     }
 
-    pub fn is_controller(&self) -> bool {
-        self.is_controller
+    async fn handle_client(&self) -> RafkaResult<()> {
+        Ok(())
     }
 
-    pub fn get_broker_id(&self) -> BrokerId {
-        self.id
-    }   
+    async fn handle_command(&self) -> RafkaResult<()> {
+        Ok(())
+    }
 }

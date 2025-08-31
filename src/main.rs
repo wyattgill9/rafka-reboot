@@ -38,9 +38,6 @@
 /// MAIN
 
 use cbridge::add;
-use broker::Broker;
+use client::Client;
 
-fn main() {
-    let mut broker: Broker = Broker::new(0, String::from("2020"));
-    println!("{}", broker.is_controller());
-}
+fn main() {}

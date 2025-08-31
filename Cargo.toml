@@ -19,6 +19,6 @@ members = [
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
-clap =  { version = "4", features = ["derive"] }
 rkyv =  { version = "0.8.11" }
 dashmap = "6.1.0"
+thiserror = "1.0"

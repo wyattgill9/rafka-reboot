@@ -5,5 +5,6 @@ edition = "2024"
 
 [dependencies]
 util = { path = "../util" }
-tokio.workspace   = true
-dashmap.workspace = true
+tokio.workspace =     true
+dashmap.workspace =   true
+thiserror.workspace = true

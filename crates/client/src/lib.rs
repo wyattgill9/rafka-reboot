@@ -8,19 +8,21 @@ use std::io;
 
 // $ rafka server start
 
-// use rafka::client::Client;
+ // use rafka::client::Client;
 
-// #[tokio::main]
-// async fn main() -> Result<()> {
-//     let client = Client::connect("localhost:8080").await?;  
-//     // Publish a message
-//     client.publish("my-topic", "Hello, Rafka!").await?;
-//     // Subscribe to messages
-//     let mut subscriber = client.subscribe("my-topic").await?;
-//     while let Some(msg) = subscriber.next().await {
-//         println!("Received: {}", msg);
-//     }
-// }
+ // #[tokio::main]
+ // async fn main() -> Result<()> {
+ //     let client = Client::connect("localhost:8080").await?;  
+
+ //     // Publish a message
+ //     client.publish("my-topic", "Hello, Rafka!").await?;
+
+ //     // Subscribe to messages
+ //     let mut subscriber = client.subscribe("my-topic").await?;
+ //     while let Some(msg) = subscriber.next().await {
+ //         println!("Received: {}", msg);
+ //     }
+ // }
 
 pub struct Client {
     stream: TcpStream,
@@ -34,7 +36,9 @@ impl Client {
         Ok(Client { stream })
     }
 
-    // pub fn publish(&self, topic: &str, message: &str) {}
+    pub fn publish(&self, topic: &str, message: &str) {
+        
+    }
 
-    // pub fn subscribe(&self, topic: &str) {}
+    pub fn subscribe(&self, topic: &str) {}
 }
