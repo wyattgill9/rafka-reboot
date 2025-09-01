@@ -1,6 +1,6 @@
 // TODO move to u64 as usize is inconsitent on ALL systems
 
-#![allow(unused_imports, dead_code)]
+#![allow(unused_imports, dead_code, unused_mut)]
 
 use std::{
     collections::VecDeque,
@@ -9,12 +9,13 @@ use std::{
 
 use tokio::{
     net::{TcpListener, TcpSocket, TcpStream},
-    sync::{mpsc, Mutex},
+    sync::{mpsc, Mutex, broadcast},
     io::{AsyncWriteExt, AsyncReadExt}
 };
 
-// use rkyv::ser::{Serializer, serializers::AllocSerializer};
-use rkyv::{to_bytes, Archive, Deserialize, Serialize};
+use rkyv::{
+    deserialize, rancor::Error, to_bytes, Archive, Archived, Deserialize, DeserializeUnsized, Serialize
+};
 
 use dashmap::DashMap;
 
@@ -27,8 +28,12 @@ pub type RafkaResult<T> = std::result::Result<T, RafkaError>;
 pub enum RafkaError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
     #[error("Serialization error: {0}")]   
     Serialization(String),
+
+    #[error("Deserialization error: {0}")]
+    Deserialization(String)
 }
 
 pub type PartitionId = usize;
@@ -43,23 +48,23 @@ pub struct Message {
     pub partition: PartitionId,
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[derive(Archive, Serialize, Deserialize)]
+#[derive(Debug)]
 pub enum RafkaCommand {
     Publish     { topic: String, payload: Vec<u8> },
     Subscribe   { topic: String },
     Unsubscribe { topic: String },
     CreateTopic { topic: String, partitions: u32 },
     ListTopics, // TODO
-    Heartbeat,
 }
 
 #[derive(Archive, Serialize, Deserialize)]
 pub enum RafkaResponse {
-    Ok,
-    Error(String),
-    Message(Message),
-    Topics(Vec<String>),
-    Subscribed { topic: String },
+    Ok, // self
+    Error(String), //self
+    Message(Message), // publish
+    Topics(Vec<String>), // list topics
+    Subscribed { topic: String }, // self
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +100,9 @@ pub struct Topic {
     pub name:           String, // ie "8080"
     pub partitions:     Vec<Arc<RwLock<Partition>>>,
 
+    // Clients
+    pub subscribers:    broadcast::Sender<Message>,
+
     // Metadata
     pub cur_partition:  AtomicUsize,
     pub cur_id:         AtomicUsize
@@ -105,6 +113,7 @@ impl Clone for Topic {
         Self {
             name:          self.name.clone(),
             partitions:    self.partitions.clone(),
+            subscribers:   self.subscribers.clone(),
             cur_partition: AtomicUsize::new(self.cur_partition.load(Ordering::SeqCst)), 
             cur_id:        AtomicUsize::new(self.cur_id.load(Ordering::SeqCst)),
         }
@@ -118,9 +127,12 @@ impl Topic {
             partitions.push(Arc::new(RwLock::new(Partition::new(p))));
         }
 
+        let (tx, _) = broadcast::channel(100);
+
         Self {
             name,
             partitions,
+            subscribers:   tx,
             cur_partition: AtomicUsize::new(0),
             cur_id:        AtomicUsize::new(0)
         }
@@ -140,11 +152,12 @@ impl Topic {
         // Write to partition
         {
             let mut part = self.partitions[part_idx].write().unwrap();
-            part.append(msg.clone())
-        }
+            part.append(msg.clone());
+        } // RAII to release the lock instead of calling drop(part);
 
-        // maybe notify subscribers idk
-
+        // notify all the subscribers (clientele)
+        let _ = self.subscribers.send(msg);
+           
         Ok(())
     }
 
@@ -183,7 +196,10 @@ impl Broker {
         }
     }
 
-    pub async fn start(&self, addr: &str) -> RafkaResult<()> {
+    pub async fn start(
+        &self,
+        addr: &str
+    ) -> RafkaResult<()> {
         let listener = TcpListener::bind(addr).await?;
         println!("Broker on {}", addr);
 
@@ -202,65 +218,118 @@ impl Broker {
         }       
     }
 
-    // harder part
-    async fn handle_client(&self, mut socket: TcpStream, client_id: usize) -> RafkaResult<()> {
-        let (mut read_half, mut write_half) = socket.into_split();            // split the socket between an async reader and writer (they are concurrent)
+    //         ┌───────────────┐
+    // tx1 ───▶│               │
+    // tx2 ───▶│    CHANNEL    │──▶ rx
+    // tx3 ───▶│               │
+    //         └───────────────┘
 
-        let write_half = Arc::new(Mutex::new(write_half));
-        let (tx, mut rx) = mpsc::unbounded_channel::<RafkaResponse>();   // channel between our reader and the writer tasks
+    async fn handle_client(
+        &self,
+        socket: TcpStream,
+        client_id: usize
+    ) -> RafkaResult<()> {
+        let (mut reader, mut writer) = socket.into_split();
+        let (tx, mut rx) = mpsc::unbounded_channel::<RafkaResponse>();
 
-        let writer_clone = Arc::clone(&write_half);
-        let write_task = tokio::spawn(async move {                       // spawn an async task that waits for the reader channel to send
-            while let Some(resp) = rx.recv().await {                     // a message to our writer channel and if it gets one send the response back through the TcpStream 
-                let mut writer = writer_clone.lock().await;
-                if let Err(e) = Self::send_response(&mut *writer, &resp).await {
-                    eprintln!("Failed to send RafkaResponse: {}", e);
-                    break;
+        // writer task
+        let writer_task = {
+            tokio::spawn(async move {
+                while let Some(resp) = rx.recv().await {    // wait to get a responce from the reader
+                    if let Err(e) = Self::send_response(&mut writer, &resp).await { // send it through tcp to the client(s)
+                        eprintln!("Failed to send client response: {}", e);
+                        break;
+                    }
                 }
-            }
-        });
+            })
+        };
 
-        let mut buffer = vec![0u8; 8192];                                 // reciever task that waits to get a client response, puts it in a buffer and handles the given command
-        loop {
-            let n = read_half.read(&mut buffer).await?;
+        let mut buffer = vec![0u8; 8192];
 
+        while let Ok(n) = reader.read(&mut buffer).await {
             if n == 0 {
-                break; // the connection was closed
+                break;
             }
-
-            match self.handle_command(&buffer[..n], &tx).await {
-                Ok(()) => {},
-                Err(e) => {
-                    let _ = tx.send(RafkaResponse::Error(e.to_string()));
-                }
+            if let Err(e) = self.handle_command(&buffer[..n], &tx).await {
+                let _ = tx.send(RafkaResponse::Error(e.to_string()));
             }
-
-            
         }
-        
-        write_task.abort();
+
+        writer_task.abort();
         println!("Client {} disconnected", client_id);
         Ok(())
     }
 
-    async fn handle_command(&self, data: &[u8], tx: &mpsc::UnboundedSender<RafkaResponse>) -> RafkaResult<()> {
+    async fn handle_command(
+        &self,
+        data: &[u8],
+        tx: &mpsc::UnboundedSender<RafkaResponse> // transmitter/sender
+    ) -> RafkaResult<()> {
+        if data.len() <= 4 {
+            return Err(RafkaError::Deserialization("Command is to short".to_string()));
+        }
+
+        // get length of the messages - unsafe is 2 instructions faster smh
+        //  let len = unsafe {
+        //      let ptr = data.as_ptr() as *const u32;
+        //      ptr.read_unaligned()
+        //  };
+
+        let len = usize::from_ne_bytes(data[..4].try_into().unwrap());
+
+        // deserialize from start of payload to end pos
+        let archived = rkyv::access::<Archived<RafkaCommand>, Error>(&data[4..4+len]).unwrap(); 
+        let command  = deserialize::<RafkaCommand, Error>(archived).unwrap();
+
+        println!("{:?}", command);
+        
+        match command {
+            RafkaCommand::Publish {
+                topic,
+                payload
+            } => {
+                let topic = self.topics.get(&topic).unwrap(); // dashmap::Ref<T> derefs to &T
+                topic.publish(payload).await?;
+                tx.send(RafkaResponse::Ok).unwrap();
+            },
+            RafkaCommand::Subscribe { topic } => {
+                
+            },
+            RafkaCommand::Unsubscribe { topic } => {
+                
+            },
+            RafkaCommand::CreateTopic { topic, partitions } => {
+                
+            },
+            RafkaCommand::ListTopics => {
+                let topics: Vec<String> = self.topics
+                                .iter()
+                                .map(|entry| entry.key().clone())
+                                .collect();
+
+                let resp = RafkaResponse::Topics(topics);
+                tx.send(resp).unwrap();
+            },
+        }
         Ok(())
     }
+
+    // -- Outbound/Inbound Protocol Specs --
+    //
+    // [Payload-Length (u32)] - [Payload]
 
     async fn send_response(
         writer: &mut tokio::net::tcp::OwnedWriteHalf,
         response: &RafkaResponse,
     ) -> RafkaResult<()> {
-        let bytes = to_bytes::<_>(response)?;
-            .map_err(|e| RafkaError::Serialization(e.to_string()))?;
 
-        writer.write_u32(bytes.len() as u32).await?;
+        let bytes = rkyv::to_bytes::<Error>(response).unwrap();
+        println!("{:?}", bytes);
+          
+        writer.write_u32(bytes.len() as u32).await?; 
         writer.write_all(&bytes).await?;
         writer.flush().await?;
 
         Ok(())
     }
-
-
-
 }
