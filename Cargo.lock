@@ -49,6 +49,7 @@ name = "broker"
 version = "0.1.0"
 dependencies = [
  "dashmap",
+ "rkyv",
  "thiserror",
  "tokio",
  "util",
