@@ -14,13 +14,14 @@ use tokio::{
 };
 
 // use rkyv::ser::{Serializer, serializers::AllocSerializer};
-use rkyv::to_bytes;
+use rkyv::{to_bytes, Archive, Deserialize, Serialize};
 
 use dashmap::DashMap;
 
 use util::global_time;
 
 pub type RafkaResult<T> = std::result::Result<T, RafkaError>;
+
 
 #[derive(Debug, thiserror::Error)]
 pub enum RafkaError {
@@ -32,6 +33,7 @@ pub enum RafkaError {
 
 pub type PartitionId = usize;
 
+#[derive(Archive, Serialize, Deserialize)]
 #[derive(Debug, Clone)]
 pub struct Message {
     pub id:        u64,
@@ -51,6 +53,7 @@ pub enum RafkaCommand {
     Heartbeat,
 }
 
+#[derive(Archive, Serialize, Deserialize)]
 pub enum RafkaResponse {
     Ok,
     Error(String),
@@ -248,9 +251,9 @@ impl Broker {
         writer: &mut tokio::net::tcp::OwnedWriteHalf,
         response: &RafkaResponse,
     ) -> RafkaResult<()> {
-        let bytes = to_bytes::<_, 1024>(response)
+        let bytes = to_bytes::<_>(response)?;
             .map_err(|e| RafkaError::Serialization(e.to_string()))?;
-    
+
         writer.write_u32(bytes.len() as u32).await?;
         writer.write_all(&bytes).await?;
         writer.flush().await?;
