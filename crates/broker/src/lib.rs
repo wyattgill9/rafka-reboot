@@ -4,7 +4,7 @@
 
 use std::{
     collections::VecDeque,
-    sync::{Arc, RwLock, atomic::{AtomicUsize, Ordering}}
+    sync::{Arc, RwLock, atomic::{AtomicUsize, Ordering, AtomicU32}}
 };
 
 use tokio::{
@@ -14,7 +14,8 @@ use tokio::{
 };
 
 use rkyv::{
-    deserialize, rancor::Error, to_bytes, Archive, Archived, Deserialize, DeserializeUnsized, Serialize
+    deserialize, rancor::Error, to_bytes,
+    Archive, Archived, Deserialize, DeserializeUnsized, Serialize
 };
 
 use dashmap::DashMap;
@@ -36,7 +37,7 @@ pub enum RafkaError {
     Deserialization(String)
 }
 
-pub type PartitionId = usize;
+pub type PartitionId = u32;
 
 #[derive(Archive, Serialize, Deserialize)]
 #[derive(Debug, Clone)]
@@ -54,7 +55,7 @@ pub enum RafkaCommand {
     Publish     { topic: String, payload: Vec<u8> },
     Subscribe   { topic: String },
     Unsubscribe { topic: String },
-    CreateTopic { topic: String, partitions: u32 },
+    CreateTopic { topic: String, partition_count: u32 },
     ListTopics, // TODO
 }
 
@@ -104,8 +105,8 @@ pub struct Topic {
     pub subscribers:    broadcast::Sender<Message>,
 
     // Metadata
-    pub cur_partition:  AtomicUsize,
-    pub cur_id:         AtomicUsize
+    pub cur_partition:  AtomicU32,
+    pub cur_id:         AtomicU32
 }
 
 impl Clone for Topic {
@@ -114,27 +115,27 @@ impl Clone for Topic {
             name:          self.name.clone(),
             partitions:    self.partitions.clone(),
             subscribers:   self.subscribers.clone(),
-            cur_partition: AtomicUsize::new(self.cur_partition.load(Ordering::SeqCst)), 
-            cur_id:        AtomicUsize::new(self.cur_id.load(Ordering::SeqCst)),
+            cur_partition: AtomicU32::new(self.cur_partition.load(Ordering::SeqCst)), 
+            cur_id:        AtomicU32::new(self.cur_id.load(Ordering::SeqCst)),
         }
     }
 }
 
 impl Topic {
-    pub fn new(name: String, partition_count: usize) -> Self {
+    pub fn new(name: String, partition_count: u32) -> Self {
         let mut partitions: Vec<Arc<RwLock<Partition>>> = Vec::with_capacity(partition_count as usize);
         for p in 0..=partition_count {
             partitions.push(Arc::new(RwLock::new(Partition::new(p))));
         }
 
-        let (tx, _) = broadcast::channel(100);
+        let (tx, _rx) = broadcast::channel(100);
 
         Self {
             name,
             partitions,
             subscribers:   tx,
-            cur_partition: AtomicUsize::new(0),
-            cur_id:        AtomicUsize::new(0)
+            cur_partition: AtomicU32::new(0),
+            cur_id:        AtomicU32::new(0)
         }
     }
 
@@ -151,7 +152,7 @@ impl Topic {
 
         // Write to partition
         {
-            let mut part = self.partitions[part_idx].write().unwrap();
+            let mut part = self.partitions[part_idx as usize].write().unwrap();
             part.append(msg.clone());
         } // RAII to release the lock instead of calling drop(part);
 
@@ -161,10 +162,14 @@ impl Topic {
         Ok(())
     }
 
+    pub async fn subscribe(&self) -> broadcast::Receiver<Message> {
+        self.subscribers.subscribe()        
+    }
+
     /// Simple Round Robin
     fn get_partition(&self) -> PartitionId {
         let i = self.cur_partition.fetch_add(1, Ordering::Relaxed);
-        i % self.partitions.len()
+        i % self.partitions.len() as u32
     }
 
     fn get_new_message_id(&self) -> u64 {
@@ -236,8 +241,8 @@ impl Broker {
         let writer_task = {
             tokio::spawn(async move {
                 while let Some(resp) = rx.recv().await {    // wait to get a responce from the reader
-                    if let Err(e) = Self::send_response(&mut writer, &resp).await { // send it through tcp to the client(s)
-                        eprintln!("Failed to send client response: {}", e);
+                    if let Err(e) = Self::send_response(&mut writer, &resp).await { // send it through
+                        eprintln!("Failed to send client response: {}", e);         //tcp to the client(s)
                         break;
                     }
                 }
@@ -292,19 +297,32 @@ impl Broker {
                 topic.publish(payload).await?;
                 tx.send(RafkaResponse::Ok).unwrap();
             },
-            RafkaCommand::Subscribe { topic } => {
-                
+            RafkaCommand::Subscribe {
+                topic
+            } => {
+                let target_topic = self.topics.get(&topic).unwrap();
+                target_topic.subscribe().await;
+
+                tx.send(RafkaResponse::Subscribed { topic }).unwrap();
             },
-            RafkaCommand::Unsubscribe { topic } => {
-                
+            RafkaCommand::Unsubscribe {
+                topic: _
+            } => {
+                todo!();
             },
-            RafkaCommand::CreateTopic { topic, partitions } => {
-                
+            RafkaCommand::CreateTopic {
+                topic,
+                partition_count
+            } => {
+                let new_topic: Topic = Topic::new(topic.clone(), partition_count);
+                self.topics.insert(topic, new_topic);
+
+                tx.send(RafkaResponse::Ok).unwrap()
             },
             RafkaCommand::ListTopics => {
                 let topics: Vec<String> = self.topics
                                 .iter()
-                                .map(|entry| entry.key().clone())
+                                .map(|entry| entry.key().clone()) // stirng so we gotta clone smh no deref
                                 .collect();
 
                 let resp = RafkaResponse::Topics(topics);
