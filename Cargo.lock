@@ -50,7 +50,6 @@ version = "0.1.0"
 dependencies = [
  "dashmap",
  "rkyv",
- "thiserror",
  "tokio",
  "util",
 ]
@@ -120,6 +119,8 @@ version = "0.1.0"
 name = "client"
 version = "0.1.0"
 dependencies = [
+ "broker",
+ "rkyv",
  "tokio",
  "util",
 ]
@@ -356,6 +357,7 @@ dependencies = [
  "broker",
  "cbridge",
  "client",
+ "tokio",
  "util",
 ]
 
@@ -565,6 +567,7 @@ name = "util"
 version = "0.1.0"
 dependencies = [
  "rkyv",
+ "thiserror",
 ]
 
 [[package]]

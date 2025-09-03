@@ -4,5 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-util = { path = "../util" }
+util =   { path = "../util"   }
+broker = { path = "../broker" }
 tokio.workspace = true
+rkyv.workspace  = true

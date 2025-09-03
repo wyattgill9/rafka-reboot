@@ -38,6 +38,14 @@
 /// MAIN
 
 use cbridge::add;
+use broker::Broker; 
 use client::Client;
 
-fn main() {}
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let broker = Broker::new();
+
+    broker.start("127.0.0.1:9000").await?;
+
+    Ok(())
+}

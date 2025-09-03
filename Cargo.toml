@@ -8,6 +8,7 @@ broker  = { version = "0.1.0", path = "crates/broker"  }
 client  = { version = "0.1.0", path = "crates/client"  } 
 cbridge = { version = "0.1.0", path = "crates/cbridge" }
 util    = { version = "0.1.0", path = "crates/util"    }
+tokio.workspace = true
 
 [workspace]
 members = [

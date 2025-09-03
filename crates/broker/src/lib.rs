@@ -1,6 +1,6 @@
 // TODO move to u64 as usize is inconsitent on ALL systems
 
-#![allow(unused_imports, dead_code, unused_mut)]
+// #![allow(dead_code, unused_mut)]
 
 use std::{
     collections::VecDeque,
@@ -14,59 +14,19 @@ use tokio::{
 };
 
 use rkyv::{
-    deserialize, rancor::Error, to_bytes,
-    Archive, Archived, Deserialize, DeserializeUnsized, Serialize
+    deserialize, rancor::Error, 
+    Archived
 };
 
 use dashmap::DashMap;
 
-use util::global_time;
-
-pub type RafkaResult<T> = std::result::Result<T, RafkaError>;
-
-
-#[derive(Debug, thiserror::Error)]
-pub enum RafkaError {
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("Serialization error: {0}")]   
-    Serialization(String),
-
-    #[error("Deserialization error: {0}")]
-    Deserialization(String)
-}
-
-pub type PartitionId = u32;
-
-#[derive(Archive, Serialize, Deserialize)]
-#[derive(Debug, Clone)]
-pub struct Message {
-    pub id:        u64,
-    pub topic:     String, // addr
-    pub payload:   Vec<u8>,
-    pub timestamp: u64,
-    pub partition: PartitionId,
-}
-
-#[derive(Archive, Serialize, Deserialize)]
-#[derive(Debug)]
-pub enum RafkaCommand {
-    Publish     { topic: String, payload: Vec<u8> },
-    Subscribe   { topic: String },
-    Unsubscribe { topic: String },
-    CreateTopic { topic: String, partition_count: u32 },
-    ListTopics, // TODO
-}
-
-#[derive(Archive, Serialize, Deserialize)]
-pub enum RafkaResponse {
-    Ok, // self
-    Error(String), //self
-    Message(Message), // publish
-    Topics(Vec<String>), // list topics
-    Subscribed { topic: String }, // self
-}
+use util::{
+    PartitionId,
+    Message,
+    RafkaCommand, RafkaResponse,
+    RafkaResult, RafkaError,
+    global_time
+};
 
 #[derive(Debug, Clone)]
 pub struct Partition {
@@ -124,7 +84,7 @@ impl Clone for Topic {
 impl Topic {
     pub fn new(name: String, partition_count: u32) -> Self {
         let mut partitions: Vec<Arc<RwLock<Partition>>> = Vec::with_capacity(partition_count as usize);
-        for p in 0..=partition_count {
+        for p in 0..partition_count {
             partitions.push(Arc::new(RwLock::new(Partition::new(p))));
         }
 
@@ -152,12 +112,19 @@ impl Topic {
 
         // Write to partition
         {
-            let mut part = self.partitions[part_idx as usize].write().unwrap();
+            let mut part = self.partitions[part_idx as usize]
+                .write()
+                .expect("Partition lock poisoned");
+      
             part.append(msg.clone());
         } // RAII to release the lock instead of calling drop(part);
 
         // notify all the subscribers (clientele)
-        let _ = self.subscribers.send(msg);
+        if let Err(e) = self.subscribers.send(msg) {
+            eprintln!("Broadcast send error: {:?}", e); // remmeber to do debug when using eprintln!
+        }
+        
+
            
         Ok(())
     }
@@ -220,7 +187,7 @@ impl Broker {
                     eprintln!("client_id {} err: {}", client_id, e);
                 }
             });
-        }       
+        }
     }
 
     //         ┌───────────────┐
@@ -270,7 +237,7 @@ impl Broker {
         data: &[u8],
         tx: &mpsc::UnboundedSender<RafkaResponse> // transmitter/sender
     ) -> RafkaResult<()> {
-        if data.len() <= 4 {
+        if data.len() <= 12 {
             return Err(RafkaError::Deserialization("Command is to short".to_string()));
         }
 
@@ -283,8 +250,11 @@ impl Broker {
         let len = usize::from_ne_bytes(data[..4].try_into().unwrap());
 
         // deserialize from start of payload to end pos
-        let archived = rkyv::access::<Archived<RafkaCommand>, Error>(&data[4..4+len]).unwrap(); 
-        let command  = deserialize::<RafkaCommand, Error>(archived).unwrap();
+        let archived = rkyv::access::<Archived<RafkaCommand>, Error>(&data[4..4+len])
+            .map_err(|e| RafkaError::Deserialization(e.to_string()))?;
+
+        let command  = deserialize::<RafkaCommand, Error>(archived)
+            .map_err(|e| RafkaError::Deserialization(e.to_string()))?;
 
         println!("{:?}", command);
         
@@ -293,15 +263,21 @@ impl Broker {
                 topic,
                 payload
             } => {
-                let topic = self.topics.get(&topic).unwrap(); // dashmap::Ref<T> derefs to &T
-                topic.publish(payload).await?;
-                tx.send(RafkaResponse::Ok).unwrap();
+                if let Some(topic) = self.topics.get(&topic) { // dashmap::Ref<T> derefs to &T                    
+                    topic.publish(payload).await?;
+                    tx.send(RafkaResponse::Ok).unwrap();
+                } else {
+                    tx.send(RafkaResponse::Error(format!("Topic '{}' not found", topic))).unwrap();
+                }
             },
             RafkaCommand::Subscribe {
                 topic
             } => {
-                let target_topic = self.topics.get(&topic).unwrap();
-                target_topic.subscribe().await;
+                if let Some(target_topic) = self.topics.get(&topic) {
+                    target_topic.subscribe().await;
+                } else {
+                    tx.send(RafkaResponse::Error(format!("Topic '{}' not found", topic))).unwrap();
+                }
 
                 tx.send(RafkaResponse::Subscribed { topic }).unwrap();
             },
@@ -341,7 +317,9 @@ impl Broker {
         response: &RafkaResponse,
     ) -> RafkaResult<()> {
 
-        let bytes = rkyv::to_bytes::<Error>(response).unwrap();
+        let bytes = rkyv::to_bytes::<Error>(response)
+            .map_err(|e| RafkaError::Serialization(e.to_string()))?;
+
         println!("{:?}", bytes);
           
         writer.write_u32(bytes.len() as u32).await?; 
@@ -349,5 +327,5 @@ impl Broker {
         writer.flush().await?;
 
         Ok(())
-    }
+   }
 }

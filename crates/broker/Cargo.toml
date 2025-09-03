@@ -7,5 +7,4 @@ edition = "2024"
 util = { path = "../util" }
 tokio.workspace =     true
 dashmap.workspace =   true
-thiserror.workspace = true
 rkyv.workspace =      true
