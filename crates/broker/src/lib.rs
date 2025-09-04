@@ -4,7 +4,7 @@
 
 use std::{
     collections::VecDeque,
-    sync::{Arc, RwLock, atomic::{AtomicUsize, Ordering, AtomicU32}}
+    sync::{atomic::{AtomicU32, AtomicUsize, Ordering}, mpsc::Receiver, Arc, RwLock}
 };
 
 use tokio::{
@@ -14,8 +14,8 @@ use tokio::{
 };
 
 use rkyv::{
-    deserialize, rancor::Error, 
-    Archived
+    access, deserialize, rancor::Error,
+        Archived
 };
 
 use dashmap::DashMap;
@@ -147,15 +147,15 @@ impl Topic {
 
 #[derive(Debug)]
 pub struct Broker {
-    topics:         DashMap<String, Topic>,
-    next_client_id: AtomicUsize
+    topics:         Arc<DashMap<String, Topic>>,
+    next_client_id: Arc<AtomicUsize>
 }
 
 impl Clone for Broker {
     fn clone(&self) -> Self {
         Self {
             topics:         self.topics.clone(),
-            next_client_id: AtomicUsize::new(self.next_client_id.load(Ordering::SeqCst))
+            next_client_id: Arc::new(AtomicUsize::new(self.next_client_id.load(Ordering::SeqCst)))
         }
     }
 }
@@ -163,15 +163,12 @@ impl Clone for Broker {
 impl Broker {
     pub fn new() -> Self {
         Self {
-            topics:         DashMap::new(),
-            next_client_id: AtomicUsize::new(0),
+            topics:         Arc::new(DashMap::new()),
+            next_client_id: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    pub async fn start(
-        &self,
-        addr: &str
-    ) -> RafkaResult<()> {
+    pub async fn start(self: Arc<Self>, addr: &str) -> RafkaResult<()> {
         let listener = TcpListener::bind(addr).await?;
         println!("Broker on {}", addr);
 
@@ -179,8 +176,8 @@ impl Broker {
             let (socket, addr) = listener.accept().await?;
             println!("New client connected {}", addr);
 
-            let broker = self.clone();
-            let client_id = self.next_client_id.fetch_add(1, Ordering::SeqCst);
+            let broker = Arc::clone(&self);
+            let client_id = broker.next_client_id.fetch_add(1, Ordering::SeqCst);
 
             tokio::spawn(async move {
                 if let Err(e) = broker.handle_client(socket, client_id).await {
@@ -205,105 +202,104 @@ impl Broker {
         let (tx, mut rx) = mpsc::unbounded_channel::<RafkaResponse>();
 
         // writer task
-        let writer_task = {
-            tokio::spawn(async move {
-                while let Some(resp) = rx.recv().await {    // wait to get a responce from the reader
-                    if let Err(e) = Self::send_response(&mut writer, &resp).await { // send it through
-                        eprintln!("Failed to send client response: {}", e);         //tcp to the client(s)
-                        break;
-                    }
+        tokio::spawn(async move {
+            while let Some(resp) = rx.recv().await {    // wait to get a responce from the reader
+                if let Err(e) = Self::send_response(&mut writer, &resp).await { // send it through
+                    eprintln!("Failed to send client response: {}", e);         //tcp to the client(s)
+                    break;
                 }
-            })
-        };
+            }
+        });
 
-        let mut buffer = vec![0u8; 8192];
+        let mut read_buf = [0u8; 4];
 
-        while let Ok(n) = reader.read(&mut buffer).await {
-            if n == 0 {
+        loop {
+            if reader.read_exact(&mut read_buf).await.is_err() {
                 break;
             }
-            if let Err(e) = self.handle_command(&buffer[..n], &tx).await {
-                let _ = tx.send(RafkaResponse::Error(e.to_string()));
-            }
-        }
+            
+            let len = u32::from_be_bytes(read_buf);
 
-        writer_task.abort();
-        println!("Client {} disconnected", client_id);
-        Ok(())
-    }
+            let mut payload = vec![0u8; len as usize];
+            reader.read_exact(&mut payload).await?;
+          
+            let archived = access::<Archived<RafkaCommand>, Error>(&payload)
+                .map_err(|e| RafkaError::Deserialization(e.to_string()))?;
 
-    async fn handle_command(
-        &self,
-        data: &[u8],
-        tx: &mpsc::UnboundedSender<RafkaResponse> // transmitter/sender
-    ) -> RafkaResult<()> {
-        if data.len() <= 12 {
-            return Err(RafkaError::Deserialization("Command is to short".to_string()));
-        }
+            let command = deserialize::<RafkaCommand, Error>(archived)
+                .map_err(|e| RafkaError::Deserialization(e.to_string()))?;
 
-        // get length of the messages - unsafe is 2 instructions faster smh
-        //  let len = unsafe {
-        //      let ptr = data.as_ptr() as *const u32;
-        //      ptr.read_unaligned()
-        //  };
-
-        let len = usize::from_ne_bytes(data[..4].try_into().unwrap());
-
-        // deserialize from start of payload to end pos
-        let archived = rkyv::access::<Archived<RafkaCommand>, Error>(&data[4..4+len])
-            .map_err(|e| RafkaError::Deserialization(e.to_string()))?;
-
-        let command  = deserialize::<RafkaCommand, Error>(archived)
-            .map_err(|e| RafkaError::Deserialization(e.to_string()))?;
-
-        println!("{:?}", command);
+            println!("{:?}", command);
         
-        match command {
-            RafkaCommand::Publish {
-                topic,
-                payload
-            } => {
-                if let Some(topic) = self.topics.get(&topic) { // dashmap::Ref<T> derefs to &T                    
-                    topic.publish(payload).await?;
-                    tx.send(RafkaResponse::Ok).unwrap();
-                } else {
-                    tx.send(RafkaResponse::Error(format!("Topic '{}' not found", topic))).unwrap();
-                }
-            },
-            RafkaCommand::Subscribe {
-                topic
-            } => {
-                if let Some(target_topic) = self.topics.get(&topic) {
-                    target_topic.subscribe().await;
-                } else {
-                    tx.send(RafkaResponse::Error(format!("Topic '{}' not found", topic))).unwrap();
-                }
+            match command {
+                RafkaCommand::Publish {
+                    topic,
+                    payload
+                } => {
+                    if let Some(topic) = self.topics.get(&topic) { // dashmap::Ref<T> derefs to &T                    
+                        println!("published");
+                        topic.publish(payload).await?;
+                        tx.send(RafkaResponse::Ok).unwrap();
+                    } else {
+                        tx.send(RafkaResponse::Error(format!("Topic '{}' not found", topic))).unwrap();
+                    }
+                },
+                RafkaCommand::Subscribe {
+                    topic
+                } => {
+                    if let Some(target_topic) = self.topics.get(&topic) {
+                        let mut rx: broadcast::Receiver<Message> = target_topic.subscribe().await;
 
-                tx.send(RafkaResponse::Subscribed { topic }).unwrap();
-            },
-            RafkaCommand::Unsubscribe {
-                topic: _
-            } => {
-                todo!();
-            },
-            RafkaCommand::CreateTopic {
-                topic,
-                partition_count
-            } => {
-                let new_topic: Topic = Topic::new(topic.clone(), partition_count);
-                self.topics.insert(topic, new_topic);
+                        tx.send(RafkaResponse::Subscribed { topic }).unwrap();
 
-                tx.send(RafkaResponse::Ok).unwrap()
-            },
-            RafkaCommand::ListTopics => {
-                let topics: Vec<String> = self.topics
-                                .iter()
-                                .map(|entry| entry.key().clone()) // stirng so we gotta clone smh no deref
-                                .collect();
+                        // make a new sender
+                        let tx2 = tx.clone();
 
-                let resp = RafkaResponse::Topics(topics);
-                tx.send(resp).unwrap();
-            },
+                        // spawn a task to send a message every time we get one
+                        tokio::spawn(async move {
+                            loop {
+                                match rx.recv().await {
+                                    Ok(msg) =>  {
+                                        println!("Subscriber got message: {:?}", msg);                                        
+                                        tx2.send(RafkaResponse::Message(msg)).unwrap();
+                                    },
+                                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                                        continue; // just lagged give it a sec
+                                    },
+                                    Err(broadcast::error::RecvError::Closed) => {
+                                        break; //real error/ connection lost
+                                    }
+                                }
+                            }
+                        });                       
+                    } else {
+                        tx.send(RafkaResponse::Error(format!("Topic '{}' not found", topic))).unwrap();
+                    }
+                },
+                RafkaCommand::Unsubscribe {
+                    topic: _
+                } => {
+                    todo!();
+                },
+                RafkaCommand::CreateTopic {
+                    topic,
+                    partition_count
+                } => {
+                    let new_topic: Topic = Topic::new(topic.clone(), partition_count);
+                    self.topics.insert(topic, new_topic);
+
+                    tx.send(RafkaResponse::Ok).unwrap()
+                },
+                RafkaCommand::ListTopics => {
+                    let topics: Vec<String> = self.topics
+                                    .iter()
+                                    .map(|entry| entry.key().clone()) // stirng so we gotta clone smh no deref
+                                    .collect();
+
+                    let resp = RafkaResponse::Topics(topics);
+                    tx.send(resp).unwrap();
+                },
+            }
         }
         Ok(())
     }

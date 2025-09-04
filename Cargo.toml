@@ -1,5 +1,5 @@
 [package]
-name = "rafka-reboot"
+name = "rafka"
 version = "0.1.0"
 edition = "2024"
 
@@ -15,11 +15,11 @@ members = [
     "crates/broker" ,
     "crates/client",
     "crates/cbridge", 
-    "crates/util"   , "crates/cli",
+    "crates/util"   , 
 ]
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["full"] }
-rkyv =  { version = "0.8" }
-dashmap = "6.1.0"
-thiserror = "1.0"
+tokio =     { version = "1", features = ["full"] }
+rkyv =      { version = "0.8" }
+dashmap =   { version = "6.1.0" }
+thiserror = { version = "1.0" }

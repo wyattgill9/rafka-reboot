@@ -1,24 +1,4 @@
 #![allow(dead_code)]
-/// API
-// $ cargo install rafka
-
-// $ rafka server start
-
-//  use rafka::client::Client;
-
-//  #[tokio::main]
-//  async fn main() -> Result<()> {
-//      let client = Client::connect("localhost:8080").await?;  
-
-//      // Publish a message
-//      client.publish("my-topic", "Hello, Rafka!").await?;
-
-//      // Subscribe to messages
-//      let mut subscriber = client.subscribe("my-topic").await?;
-//      while let Some(msg) = subscriber.next().await {
-//          println!("Received: {}", msg);
-//      }
-//  }
 
 use tokio::net::{TcpSocket, TcpStream};
 use std::io;
@@ -47,8 +27,22 @@ impl Client {
     pub async fn connect(addr: &str) -> io::Result<Self> {
         let socket = TcpSocket::new_v4()?;
         let stream = socket.connect(addr.parse().unwrap()).await?;
-
+          
         Ok(Client { stream })
+    }
+
+    pub async fn create_topic(
+        &mut self,
+        topic: &str,
+        partition_count: u32
+    ) -> RafkaResult<()> {
+        let cmd = RafkaCommand::CreateTopic {
+            topic: topic.to_string(),
+            partition_count
+        };
+
+        self.send_command(&cmd).await?;
+        Ok(())
     }
 
     // TODO: make message a generic type T and a macro to make it into a Vec<u8>
@@ -64,15 +58,13 @@ impl Client {
         };
 
         self.send_command(&cmd).await?;
-        // self.
-        Ok(())
+        match self.receive_response().await {
+            Ok(RafkaResponse::Ok) => { Ok(()) }
+            _ => { panic!(); }          
+        }
     }
 
-    pub async fn subscribe(
-        &mut self,
-        topic: &str
-    ) -> RafkaResult<()> {
-
+    pub async fn subscribe(&mut self, topic: &str) -> RafkaResult<()> {               
         let cmd = RafkaCommand::Subscribe {
             topic: topic.to_string(),
         };
@@ -81,8 +73,9 @@ impl Client {
 
         let response = self.receive_response().await?;
         match response {
-            RafkaResponse::Ok => Ok(()),
-            _ => {panic!()}
+            RafkaResponse::Subscribed { topic: t } if t == topic => Ok(()),
+            RafkaResponse::Error(e) => Err(RafkaError::Deserialization(e)),
+            _ => Err(RafkaError::Deserialization("unexpected response to subscribe".to_string())),
         }
     }
 
@@ -95,33 +88,27 @@ impl Client {
         };
 
         self.send_command(&cmd).await?;
-
         let response = self.receive_response().await?;
         match response {
             RafkaResponse::Ok => Ok(()),
-            _ => {panic!()}
+            _ => { panic!() }
         }
     }        
 
     
     pub async fn list_topics(
         &mut self,
-        topic: &str
     ) -> RafkaResult<Vec<String>> {
 
-        let cmd = RafkaCommand::Subscribe {
-            topic: topic.to_string(),
-        };
+        let cmd = RafkaCommand::ListTopics;
 
         self.send_command(&cmd).await?;
 
-        let response = self.receive_response().await?;
+        let response = self.receive_response().await;
 
         match response {
-            RafkaResponse::Topics(topics) => {
-                Ok(topics)
-            },
-            _ => panic!(),
+            Ok(RafkaResponse::Topics(topics)) => { return Ok(topics) }
+            _ => { panic!() }
         }
     }
 
@@ -158,3 +145,4 @@ impl Client {
         Ok(response)
     }
 }
+
