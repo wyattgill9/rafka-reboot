@@ -1,20 +1,13 @@
-#![allow(dead_code)]
-
-use tokio::net::{TcpSocket, TcpStream};
-use std::io;
-
 use tokio::{
-    net::{TcpListener},
-    sync::{mpsc, Mutex, broadcast},
-    io::{AsyncWriteExt, AsyncReadExt}
+    net::{TcpSocket, TcpStream},
+    io::{AsyncReadExt, AsyncWriteExt}
 };
 
 use rkyv::{
-    access, deserialize, rancor::Error, Archived, DeserializeUnsized
+    access, deserialize, rancor::Error, Archived
 };
 
 use util::{
-    Message,
     RafkaCommand, RafkaResponse,
     RafkaResult, RafkaError,
 };
@@ -24,7 +17,7 @@ pub struct Client {
 }
 
 impl Client {
-    pub async fn connect(addr: &str) -> io::Result<Self> {
+    pub async fn connect(addr: &str) -> RafkaResult<Self> {
         let socket = TcpSocket::new_v4()?;
         let stream = socket.connect(addr.parse().unwrap()).await?;
           
@@ -118,7 +111,6 @@ impl Client {
     ) -> RafkaResult<()> {
 
         let bytes = rkyv::to_bytes::<Error>(response).unwrap();
-        println!("{:?}", bytes);
           
         self.stream.write_u32(bytes.len() as u32).await?; 
         self.stream.write_all(&bytes).await?;
@@ -127,7 +119,7 @@ impl Client {
         Ok(())
     }
 
-    async fn receive_response(
+    pub async fn receive_response(
         &mut self,
     ) -> RafkaResult<RafkaResponse> {
 
@@ -145,4 +137,3 @@ impl Client {
         Ok(response)
     }
 }
-

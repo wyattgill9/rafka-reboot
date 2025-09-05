@@ -1,21 +1,21 @@
-// TODO move to u64 as usize is inconsitent on ALL systems
-
-// #![allow(dead_code, unused_mut)]
-
 use std::{
     collections::VecDeque,
-    sync::{atomic::{AtomicU32, AtomicUsize, Ordering}, mpsc::Receiver, Arc, RwLock}
+    sync::{
+        atomic::{
+            AtomicU32, AtomicU64, AtomicUsize, Ordering
+        },
+        Arc, RwLock
+    }
 };
 
 use tokio::{
-    net::{TcpListener, TcpSocket, TcpStream},
-    sync::{mpsc, Mutex, broadcast},
+    net::{TcpListener, TcpStream},
+    sync::{mpsc, broadcast},
     io::{AsyncWriteExt, AsyncReadExt}
 };
 
 use rkyv::{
-    access, deserialize, rancor::Error,
-        Archived
+    access, deserialize, rancor::Error, Archived
 };
 
 use dashmap::DashMap;
@@ -28,11 +28,13 @@ use util::{
     global_time
 };
 
-#[derive(Debug, Clone)]
+const CHANNEL_BUFF_SIZE: usize = 1000;
+
+#[derive(Debug)]
 pub struct Partition {
     pub id:        PartitionId,
     pub messages:  VecDeque<Message>,
-    pub offset:    u64,
+    pub offset:    AtomicU64,
 }
 
 impl Partition {
@@ -40,25 +42,34 @@ impl Partition {
         Self {
             id,
             messages: VecDeque::new(),
-            offset:   0
+            offset:   AtomicU64::new(0),
         }
     }
 
-    pub fn append(&mut self, message: Message) {
+    pub fn append(&mut self, message: Message) -> u64 {
+        let offset = self.offset.fetch_add(1, Ordering::SeqCst);
         self.messages.push_back(message);
-        self.offset += 1;
+        offset
     }
 
     pub fn read_from(&self, offset: u64) -> impl Iterator<Item = &Message> {
         self.messages
             .iter()
-            .skip(offset as usize) // only include after messages after the given "offset"
+            .skip(offset as usize)
+    }
+
+    pub fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    pub fn current_offset(&self) -> u64 {
+        self.offset.load(Ordering::SeqCst)
     }
 }
 
 #[derive(Debug)]
 pub struct Topic {
-    pub name:           String, // ie "8080"
+    pub name:           String,
     pub partitions:     Vec<Arc<RwLock<Partition>>>,
 
     // Clients
@@ -83,12 +94,11 @@ impl Clone for Topic {
 
 impl Topic {
     pub fn new(name: String, partition_count: u32) -> Self {
-        let mut partitions: Vec<Arc<RwLock<Partition>>> = Vec::with_capacity(partition_count as usize);
-        for p in 0..partition_count {
-            partitions.push(Arc::new(RwLock::new(Partition::new(p))));
-        }
-
-        let (tx, _rx) = broadcast::channel(100);
+        let partitions: Vec<Arc<RwLock<Partition>>> = (0..partition_count)
+            .map(|p| Arc::new(RwLock::new(Partition::new(p))))
+            .collect();
+       
+        let (tx, _rx) = broadcast::channel(CHANNEL_BUFF_SIZE);
 
         Self {
             name,
@@ -99,34 +109,31 @@ impl Topic {
         }
     }
 
-    pub async fn publish(&self, payload: Vec<u8>) -> RafkaResult<()> {
-        let part_idx = self.get_partition();
+    pub async fn publish(&self, payload: Vec<u8>) -> RafkaResult<u64> {
+        let partition_id = self.get_partition();
+        let message_id   = self.get_next_message_id();
 
         let msg = Message {
-            id: Self::get_new_message_id(&self),
-            topic: self.name.clone() ,
+            id:        message_id,
+            topic:     self.name.clone() ,
             payload,
             timestamp: global_time(),
-            partition: part_idx,
+            partition: partition_id,
         };
 
-        // Write to partition
-        {
-            let mut part = self.partitions[part_idx as usize]
+        let offset = {
+            let mut part = self.partitions[partition_id as usize]
                 .write()
                 .expect("Partition lock poisoned");
-      
-            part.append(msg.clone());
-        } // RAII to release the lock instead of calling drop(part);
+          
+            part.append(msg.clone())
+        };
 
-        // notify all the subscribers (clientele)
-        if let Err(e) = self.subscribers.send(msg) {
-            eprintln!("Broadcast send error: {:?}", e); // remmeber to do debug when using eprintln!
+        if let Err(_) = self.subscribers.send(msg) {
+            // all receivers dropped
         }
-        
-
-           
-        Ok(())
+                   
+        Ok(offset)
     }
 
     pub async fn subscribe(&self) -> broadcast::Receiver<Message> {
@@ -135,12 +142,12 @@ impl Topic {
 
     /// Simple Round Robin
     fn get_partition(&self) -> PartitionId {
-        let i = self.cur_partition.fetch_add(1, Ordering::Relaxed);
+        let i = self.cur_partition.fetch_add(1, Ordering::SeqCst);
         i % self.partitions.len() as u32
     }
 
-    fn get_new_message_id(&self) -> u64 {
-        let val = self.cur_id.fetch_add(1, Ordering::Relaxed);
+    fn get_next_message_id(&self) -> u64 {
+        let val = self.cur_id.fetch_add(1, Ordering::SeqCst);
         val.try_into().unwrap()
     }
 }
@@ -169,43 +176,43 @@ impl Broker {
     }
 
     pub async fn start(self: Arc<Self>, addr: &str) -> RafkaResult<()> {
-        let listener = TcpListener::bind(addr).await?;
-        println!("Broker on {}", addr);
-
+        let listener = TcpListener::bind(addr).await
+            .map_err(|e| RafkaError::Io(format!("Failed to bind to {}: {}", addr, e)))?;
+        
         loop {
-            let (socket, addr) = listener.accept().await?;
-            println!("New client connected {}", addr);
+            match listener.accept().await {
+                Ok((socket, addr)) => {
+                    let client_id = self.next_client_id.fetch_add(1, Ordering::SeqCst);
+                    println!("Client {} connected from {}", client_id, addr);
 
-            let broker = Arc::clone(&self);
-            let client_id = broker.next_client_id.fetch_add(1, Ordering::SeqCst);
+                    let broker = Arc::clone(&self);
 
-            tokio::spawn(async move {
-                if let Err(e) = broker.handle_client(socket, client_id).await {
-                    eprintln!("client_id {} err: {}", client_id, e);
+                    tokio::spawn(async move {
+                        if let Err(e) = broker.handle_client(socket, client_id).await {
+                            eprintln!("Client {} err: {}", client_id, e);
+                        }
+                        println!("Client {} disconnected", client_id);
+                    });
+                },
+                Err(e) => {
+                    println!("Failed to accept connection: {}", e);
                 }
-            });
+            }
         }
     }
-
-    //         ┌───────────────┐
-    // tx1 ───▶│               │
-    // tx2 ───▶│    CHANNEL    │──▶ rx
-    // tx3 ───▶│               │
-    //         └───────────────┘
 
     async fn handle_client(
         &self,
         socket: TcpStream,
-        client_id: usize
+        _client_id: usize
     ) -> RafkaResult<()> {
         let (mut reader, mut writer) = socket.into_split();
         let (tx, mut rx) = mpsc::unbounded_channel::<RafkaResponse>();
-
-        // writer task
+       
         tokio::spawn(async move {
-            while let Some(resp) = rx.recv().await {    // wait to get a responce from the reader
-                if let Err(e) = Self::send_response(&mut writer, &resp).await { // send it through
-                    eprintln!("Failed to send client response: {}", e);         //tcp to the client(s)
+            while let Some(resp) = rx.recv().await {
+                if let Err(e) = Self::send_response(&mut writer, &resp).await {
+                    eprintln!("Failed to send client response: {}", e);
                     break;
                 }
             }
@@ -221,8 +228,11 @@ impl Broker {
             let len = u32::from_be_bytes(read_buf);
 
             let mut payload = vec![0u8; len as usize];
-            reader.read_exact(&mut payload).await?;
-          
+
+            if reader.read_exact(&mut payload).await.is_err() {
+                break;
+            }
+                      
             let archived = access::<Archived<RafkaCommand>, Error>(&payload)
                 .map_err(|e| RafkaError::Deserialization(e.to_string()))?;
 
@@ -236,7 +246,7 @@ impl Broker {
                     topic,
                     payload
                 } => {
-                    if let Some(topic) = self.topics.get(&topic) { // dashmap::Ref<T> derefs to &T                    
+                    if let Some(topic) = self.topics.get(&topic) {
                         println!("published");
                         topic.publish(payload).await?;
                         tx.send(RafkaResponse::Ok).unwrap();
@@ -252,10 +262,8 @@ impl Broker {
 
                         tx.send(RafkaResponse::Subscribed { topic }).unwrap();
 
-                        // make a new sender
                         let tx2 = tx.clone();
 
-                        // spawn a task to send a message every time we get one
                         tokio::spawn(async move {
                             loop {
                                 match rx.recv().await {
@@ -264,10 +272,10 @@ impl Broker {
                                         tx2.send(RafkaResponse::Message(msg)).unwrap();
                                     },
                                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                                        continue; // just lagged give it a sec
+                                        continue;
                                     },
                                     Err(broadcast::error::RecvError::Closed) => {
-                                        break; //real error/ connection lost
+                                        break;
                                     }
                                 }
                             }
@@ -293,7 +301,7 @@ impl Broker {
                 RafkaCommand::ListTopics => {
                     let topics: Vec<String> = self.topics
                                     .iter()
-                                    .map(|entry| entry.key().clone()) // stirng so we gotta clone smh no deref
+                                    .map(|entry| entry.key().clone())
                                     .collect();
 
                     let resp = RafkaResponse::Topics(topics);
@@ -304,10 +312,6 @@ impl Broker {
         Ok(())
     }
 
-    // -- Outbound/Inbound Protocol Specs --
-    //
-    // [Payload-Length (u32)] - [Payload]
-
     async fn send_response(
         writer: &mut tokio::net::tcp::OwnedWriteHalf,
         response: &RafkaResponse,
@@ -316,11 +320,10 @@ impl Broker {
         let bytes = rkyv::to_bytes::<Error>(response)
             .map_err(|e| RafkaError::Serialization(e.to_string()))?;
 
-        println!("{:?}", bytes);
-          
-        writer.write_u32(bytes.len() as u32).await?; 
-        writer.write_all(&bytes).await?;
-        writer.flush().await?;
+        // not safe but idgaf
+        let _ = writer.write_u32(bytes.len() as u32).await;
+        let _ = writer.write_all(&bytes).await;
+        let _ = writer.flush().await;
 
         Ok(())
    }

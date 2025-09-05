@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 broker  = { version = "0.1.0", path = "crates/broker"  }
 client  = { version = "0.1.0", path = "crates/client"  } 
-cbridge = { version = "0.1.0", path = "crates/cbridge" }
 util    = { version = "0.1.0", path = "crates/util"    }
 tokio.workspace = true
 
@@ -14,7 +13,6 @@ tokio.workspace = true
 members = [
     "crates/broker" ,
     "crates/client",
-    "crates/cbridge", 
     "crates/util"   , 
 ]
 

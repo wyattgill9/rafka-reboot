@@ -8,14 +8,20 @@ pub type RafkaResult<T> = std::result::Result<T, RafkaError>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RafkaError {
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
+    #[error("Io error: {0}")]
+    Io(String),
 
     #[error("Serialization error: {0}")]   
     Serialization(String),
 
     #[error("Deserialization error: {0}")]
     Deserialization(String),
+}
+
+impl From<std::io::Error> for RafkaError {
+    fn from(error: std::io::Error) -> Self {
+        RafkaError::Io(error.to_string())
+    }
 }
 
 pub type PartitionId = u32;
@@ -37,10 +43,11 @@ pub enum RafkaCommand {
     Subscribe   { topic: String },
     Unsubscribe { topic: String },
     CreateTopic { topic: String, partition_count: u32 },
-    ListTopics, // TODO
+    ListTopics,
 }
 
 #[derive(Archive, Serialize, Deserialize)]
+#[derive(Debug)]
 pub enum RafkaResponse  {
     Ok, // self
     Error(String), //self
