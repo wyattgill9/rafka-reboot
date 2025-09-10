@@ -341,6 +341,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "raft"
+version = "0.1.0"
+dependencies = [
+ "rkyv",
+ "tokio",
+]
+
+[[package]]
 name = "rancor"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

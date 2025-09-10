@@ -12,8 +12,9 @@ tokio.workspace = true
 [workspace]
 members = [
     "crates/broker" ,
-    "crates/client",
-    "crates/util"   , 
+    "crates/client" , 
+    "crates/util"   ,
+    "crates/raft"   ,
 ]
 
 [workspace.dependencies]
